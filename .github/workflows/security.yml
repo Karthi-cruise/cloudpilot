@@ -1,0 +1,272 @@
+---
+# =============================================================
+# .github/workflows/security.yml — CloudPilot Weekly Security Scan
+# Runs every Monday at 2am UTC + manual dispatch
+# Jobs: dependency-scan, sast-scan, container-scan, sbom-generation
+# =============================================================
+
+name: CloudPilot Security Scan
+
+on:
+  schedule:
+    # Every Monday at 02:00 UTC
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to scan (default: latest)'
+        required: false
+        default: 'latest'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PYTHON_VERSION: '3.12'
+
+# ─────────────────────────────────────────────────────────────
+# Job 1 — Dependency Scan (pip-audit)
+# ─────────────────────────────────────────────────────────────
+jobs:
+  dependency-scan:
+    name: 📦 Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.7.3
+
+      - name: Audit production requirements
+        run: |
+          echo "## 📦 Production Dependencies Audit" | tee audit-prod.txt
+          pip-audit -r requirements.txt --format=json --output=pip-audit-prod.json || true
+          pip-audit -r requirements.txt | tee -a audit-prod.txt
+
+      - name: Audit dev requirements
+        run: |
+          echo "## 🧰 Dev Dependencies Audit" | tee audit-dev.txt
+          pip-audit -r requirements-dev.txt --format=json --output=pip-audit-dev.json || true
+          pip-audit -r requirements-dev.txt | tee -a audit-dev.txt
+
+      - name: Upload dependency audit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-reports
+          path: |
+            pip-audit-prod.json
+            pip-audit-dev.json
+            audit-prod.txt
+            audit-dev.txt
+          retention-days: 90
+
+      - name: Post to job summary
+        run: |
+          echo "# 📦 Dependency Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "## Production" >> $GITHUB_STEP_SUMMARY
+          cat audit-prod.txt >> $GITHUB_STEP_SUMMARY
+          echo "## Dev" >> $GITHUB_STEP_SUMMARY
+          cat audit-dev.txt >> $GITHUB_STEP_SUMMARY
+
+# ─────────────────────────────────────────────────────────────
+# Job 2 — SAST Scan (Bandit)
+# ─────────────────────────────────────────────────────────────
+  sast-scan:
+    name: 🔍 SAST Scan (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Bandit
+        run: pip install bandit==1.7.10
+
+      - name: Run Bandit full SAST scan (JSON output)
+        run: |
+          bandit \
+            -r app/ \
+            -f json \
+            -o bandit-full-report.json \
+            -ll \
+            --severity-level medium \
+            --confidence-level medium \
+            || true
+
+      - name: Run Bandit (human-readable output)
+        run: |
+          bandit \
+            -r app/ \
+            -f txt \
+            -ll \
+            --severity-level medium \
+            --confidence-level medium \
+            | tee bandit-summary.txt \
+            || true
+
+      - name: Upload Bandit reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-sast-report
+          path: |
+            bandit-full-report.json
+            bandit-summary.txt
+          retention-days: 90
+
+      - name: Post Bandit summary to job summary
+        run: |
+          echo "# 🔍 SAST Scan Results (Bandit)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat bandit-summary.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+# ─────────────────────────────────────────────────────────────
+# Job 3 — Container Scan (Trivy + SARIF)
+# ─────────────────────────────────────────────────────────────
+  container-scan:
+    name: 🛡️ Container Vulnerability Scan (Trivy)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image to scan
+        id: image
+        run: |
+          TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
+          echo "ref=$IMAGE" >> $GITHUB_OUTPUT
+          echo "Scanning image: $IMAGE"
+
+      - name: Pull image
+        run: docker pull ${{ steps.image.outputs.ref }}
+
+      - name: Run Trivy full scan (all severities)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: table
+          exit-code: '0'
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          trivyignores: .trivyignore
+
+      - name: Run Trivy SARIF output for Security tab
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: sarif
+          output: trivy-security-scan.sarif
+          vuln-type: os,library
+          severity: MEDIUM,HIGH,CRITICAL
+          trivyignores: .trivyignore
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-security-scan.sarif
+
+      - name: Run Trivy JSON report
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          format: json
+          output: trivy-security-scan.json
+          vuln-type: os,library
+          severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          trivyignores: .trivyignore
+
+      - name: Upload Trivy reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-container-scan
+          path: |
+            trivy-security-scan.sarif
+            trivy-security-scan.json
+          retention-days: 90
+
+# ─────────────────────────────────────────────────────────────
+# Job 4 — SBOM Generation (Syft — SPDX format)
+# ─────────────────────────────────────────────────────────────
+  sbom-generation:
+    name: 📋 SBOM Generation (Syft/SPDX)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image to scan
+        id: image
+        run: |
+          TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
+          echo "ref=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin v1.14.1
+          syft version
+
+      - name: Generate SBOM (SPDX JSON format)
+        run: |
+          syft ${{ steps.image.outputs.ref }} \
+            -o spdx-json=cloudpilot-sbom.spdx.json \
+            --platform linux/amd64
+
+      - name: Generate SBOM (CycloneDX format — supplemental)
+        run: |
+          syft ${{ steps.image.outputs.ref }} \
+            -o cyclonedx-json=cloudpilot-sbom.cyclonedx.json \
+            --platform linux/amd64
+
+      - name: Generate SBOM summary
+        run: |
+          echo "# 📋 SBOM Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** ${{ steps.image.outputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Format:** SPDX JSON + CycloneDX JSON" >> $GITHUB_STEP_SUMMARY
+          echo "**Package count:**" >> $GITHUB_STEP_SUMMARY
+          PACKAGE_COUNT=$(cat cloudpilot-sbom.spdx.json | python3 -c "import sys,json; data=json.load(sys.stdin); print(len(data.get('packages', [])))")
+          echo "  - Packages: $PACKAGE_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan date:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-reports
+          path: |
+            cloudpilot-sbom.spdx.json
+            cloudpilot-sbom.cyclonedx.json
+          retention-days: 90

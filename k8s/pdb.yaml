@@ -1,0 +1,14 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudpilot-pdb
+  namespace: cloudpilot
+  labels:
+    app: cloudpilot
+    component: availability
+    team: platform-engineering
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: cloudpilot

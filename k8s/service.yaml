@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudpilot
+  namespace: cloudpilot
+  labels:
+    app: cloudpilot
+    version: "1.0.0"
+    component: api
+    team: platform-engineering
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app: cloudpilot
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000

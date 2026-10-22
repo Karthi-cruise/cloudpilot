@@ -1,0 +1,51 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudpilot-sa
+  namespace: cloudpilot
+  labels:
+    app: cloudpilot
+    component: rbac
+    team: platform-engineering
+  annotations:
+    description: "ServiceAccount for the CloudPilot API pods"
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cloudpilot-role
+  namespace: cloudpilot
+  labels:
+    app: cloudpilot
+    component: rbac
+    team: platform-engineering
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cloudpilot-rolebinding
+  namespace: cloudpilot
+  labels:
+    app: cloudpilot
+    component: rbac
+    team: platform-engineering
+subjects:
+  - kind: ServiceAccount
+    name: cloudpilot-sa
+    namespace: cloudpilot
+roleRef:
+  kind: Role
+  name: cloudpilot-role
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,3 @@
+# Trivy ignore file
+# False positives and accepted risks for base images
+# CVE-2023-XXXX: Documented rationale

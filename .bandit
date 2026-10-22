@@ -1,0 +1,6 @@
+[bandit]
+targets = app,ai,sre,chaos
+exclude = tests,.venv
+skips = B101
+severity = medium
+confidence = medium

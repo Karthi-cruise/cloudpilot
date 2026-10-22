@@ -1,0 +1,40 @@
+# terraform.tfvars.example
+# Copy to terraform.tfvars and fill in real values before running `terraform apply`.
+# Never commit terraform.tfvars to version control — it is listed in .gitignore.
+
+# ---------------------------------------------------------------------------
+# Cluster
+# ---------------------------------------------------------------------------
+cluster_name = "cloudpilot"
+
+# ---------------------------------------------------------------------------
+# Kubernetes
+# ---------------------------------------------------------------------------
+namespace   = "cloudpilot"
+environment = "local"   # local | staging | production
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+app_version      = "1.0.0"
+app_replicas     = 3
+log_level        = "INFO"
+image_repository = "ghcr.io/Karthi-cruise/cloudpilot"
+image_tag        = "latest"
+
+# ---------------------------------------------------------------------------
+# SLO
+# ---------------------------------------------------------------------------
+slo_availability_target = 99.5
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+grafana_admin_password = "change-me-in-production"
+prometheus_retention   = "7d"
+
+# ---------------------------------------------------------------------------
+# AI / Secrets
+# ---------------------------------------------------------------------------
+# Leave empty ("") to skip creation of the Kubernetes Secret.
+gemini_api_key = "your-api-key-here"

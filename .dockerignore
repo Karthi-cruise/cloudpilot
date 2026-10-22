@@ -1,0 +1,86 @@
+# =============================================================
+# .dockerignore — CloudPilot
+# Exclude files/dirs from Docker build context for security
+# and smaller image sizes.
+# =============================================================
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Python bytecode & caches
+__pycache__
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Test & coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Infrastructure-as-code (not needed at runtime)
+terraform/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+
+# Documentation
+docs/
+*.md
+*.rst
+mkdocs.yml
+
+# Environment files (secrets must never enter image)
+.env
+.env.*
+!.env.example
+
+# Editor / IDE config
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CI/CD configs (not needed at runtime)
+.github/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Monitoring configs (mounted at runtime)
+monitoring/
+
+# Scripts
+scripts/
+
+# Kubernetes manifests (not needed in image)
+k8s/
+
+# Misc
+*.log
+*.pid
+*.sock
+Makefile
+docker-compose*.yml

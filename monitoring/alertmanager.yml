@@ -1,0 +1,129 @@
+global:
+  # How long to wait before declaring an alert resolved if no more firing
+  resolve_timeout: 5m
+  smtp_require_tls: false
+
+  # Uncomment and configure for SMTP email alerts:
+  # smtp_smarthost: 'smtp.example.com:587'
+  # smtp_from: 'alertmanager@cloudpilot.example.com'
+  # smtp_auth_username: 'alertmanager'
+  # smtp_auth_password: 'YOUR_SMTP_PASSWORD'
+
+templates:
+  - /etc/alertmanager/templates/*.tmpl
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Routing Tree
+# ──────────────────────────────────────────────────────────────────────────────
+route:
+  # Group alerts by alertname + team to reduce noise
+  group_by: ['alertname', 'team', 'namespace']
+  # Wait 30s before sending first notification (allows related alerts to batch)
+  group_wait: 30s
+  # Wait 5m between sending updates for the same group
+  group_interval: 5m
+  # Re-notify every 4h if still firing
+  repeat_interval: 4h
+  # Default receiver for all unmatched alerts
+  receiver: 'default'
+
+  routes:
+    # ── Critical alerts: faster repeat, oncall-worthy ──────────────────────────
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 10s
+      repeat_interval: 1h
+      continue: false
+
+    # ── SLO fast burn: tightest repeat — page immediately ─────────────────────
+    - match:
+        alertname: CloudPilotSLOFastBurn
+      receiver: 'oncall'
+      group_wait: 0s
+      repeat_interval: 30m
+      continue: false
+
+    # ── Warning alerts: standard routing ──────────────────────────────────────
+    - match:
+        severity: warning
+      receiver: 'default'
+      repeat_interval: 4h
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Receivers
+# ──────────────────────────────────────────────────────────────────────────────
+receivers:
+  # Default: posts to CloudPilot's own webhook (creates/updates incidents)
+  - name: 'default'
+    webhook_configs:
+      - url: 'http://app:8000/api/v1/incidents/webhook'
+        send_resolved: true
+        max_alerts: 10
+        http_config:
+          bearer_token: 'webhook-secret-token'
+        timeout: 10s
+
+  # Critical: webhook + optional PagerDuty/Slack (uncomment for production)
+  - name: 'critical-alerts'
+    webhook_configs:
+      - url: 'http://app:8000/api/v1/incidents/webhook'
+        send_resolved: true
+        http_config:
+          bearer_token: 'webhook-secret-token'
+        timeout: 10s
+    # ── PagerDuty (production) ────────────────────────────────────────────────
+    # pagerduty_configs:
+    #   - routing_key: 'YOUR_PAGERDUTY_INTEGRATION_KEY'
+    #     severity: 'critical'
+    #     description: '{{ template "pagerduty.default.description" . }}'
+    #     client: 'CloudPilot Alertmanager'
+    #     client_url: 'http://grafana:3000/d/cloudpilot-main'
+    # ── Slack (production) ────────────────────────────────────────────────────
+    # slack_configs:
+    #   - api_url: 'YOUR_SLACK_WEBHOOK_URL'
+    #     channel: '#cloudpilot-alerts'
+    #     send_resolved: true
+    #     title: '{{ template "slack.default.title" . }}'
+    #     text: '{{ template "slack.default.text" . }}'
+    #     color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+
+  # Oncall: for SLO fast burn — tightest SLA, page on-call engineer
+  - name: 'oncall'
+    webhook_configs:
+      - url: 'http://app:8000/api/v1/incidents/webhook'
+        send_resolved: true
+        http_config:
+          bearer_token: 'webhook-secret-token'
+    # ── OpsGenie (production) ─────────────────────────────────────────────────
+    # opsgenie_configs:
+    #   - api_key: 'YOUR_OPSGENIE_API_KEY'
+    #     priority: 'P1'
+    #     message: '🔥 SLO Fast Burn: CloudPilot error budget burning fast!'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Inhibition Rules
+# Suppress lower-severity alerts when a higher-severity alert is already firing
+# for the same alertname (prevents duplicate noise).
+# ──────────────────────────────────────────────────────────────────────────────
+inhibit_rules:
+  # Suppress warnings when critical is already firing for the same alert
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'namespace']
+
+  # Suppress CloudPilotHighErrorRate when SLO burn alert is firing (it's redundant)
+  - source_match:
+      alertname: 'CloudPilotSLOFastBurn'
+    target_match:
+      alertname: 'CloudPilotHighErrorRate'
+    equal: []
+
+  # Suppress CloudPilotHighLatency / CloudPilotHighErrorRate when service is down
+  - source_match:
+      alertname: 'CloudPilotNoRequests'
+    target_match_re:
+      alertname: 'CloudPilotHigh.*'
+    equal: []

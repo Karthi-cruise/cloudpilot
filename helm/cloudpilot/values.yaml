@@ -1,0 +1,154 @@
+# Default values for cloudpilot.
+# Override these values using --set or a custom values file.
+
+# -- Number of replicas to deploy
+replicaCount: 3
+
+image:
+  # -- Container image repository
+  repository: ghcr.io/Karthi-cruise/cloudpilot
+  # -- Image pull policy (use IfNotPresent for local kind clusters)
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag whose default is the chart appVersion.
+  tag: "1.0.0"
+
+# -- Optional list of image pull secrets
+imagePullSecrets: []
+
+# -- String to partially override the fullname template
+nameOverride: ""
+# -- String to fully override the fullname template
+fullnameOverride: ""
+
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- Service port (external)
+  port: 80
+  # -- Target port on the container
+  targetPort: 8000
+  # -- Additional annotations for the Service
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8000"
+    prometheus.io/path: "/metrics"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+autoscaling:
+  # -- Enable HorizontalPodAutoscaler
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 60
+  targetMemoryUtilizationPercentage: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      stabilizationWindowSeconds: 60
+
+monitoring:
+  # -- Enable monitoring stack (kube-prometheus-stack dependency)
+  enabled: true
+  # -- Create a ServiceMonitor for Prometheus Operator
+  serviceMonitor: true
+
+slo:
+  # -- Availability SLO target (%)
+  availabilityTarget: 99.5
+  # -- P99 latency target (ms)
+  latencyP99TargetMs: 200
+  # -- Error rate SLO target (%)
+  errorRateTarget: 0.5
+
+configuration:
+  logLevel: INFO
+  version: 1.0.0
+
+podDisruptionBudget:
+  # -- Enable PodDisruptionBudget
+  enabled: true
+  # -- Minimum number of available pods during disruptions
+  minAvailable: 2
+
+networkPolicy:
+  # -- Enable NetworkPolicies
+  enabled: true
+
+security:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  dropCapabilities:
+    - ALL
+
+env:
+  # -- Extra environment variables to inject into the container
+  # Example:
+  # extraEnvVars:
+  #   - name: MY_VAR
+  #     value: "my-value"
+  extraEnvVars: []
+
+# -- Gemini API key (injected as a Secret if non-empty)
+geminiApiKey: ""
+
+# -- Node selector for pod assignment
+nodeSelector: {}
+
+# -- Tolerations for pod assignment
+tolerations: []
+
+# -- Additional pod annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8000"
+  prometheus.io/path: "/metrics"
+
+# -- Additional pod labels
+podLabels: {}
+
+# -- liveness probe configuration
+livenessProbe:
+  path: /live
+  port: 8000
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# -- readiness probe configuration
+readinessProbe:
+  path: /ready
+  port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+# -- startup probe configuration
+startupProbe:
+  path: /health
+  port: 8000
+  failureThreshold: 30
+  periodSeconds: 2
+  timeoutSeconds: 3
+
+# -- Rolling update strategy parameters
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# -- Termination grace period in seconds
+terminationGracePeriodSeconds: 30

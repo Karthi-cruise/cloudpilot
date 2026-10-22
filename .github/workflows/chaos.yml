@@ -1,0 +1,418 @@
+---
+# =============================================================
+# .github/workflows/chaos.yml — CloudPilot Chaos Engineering
+# Runs weekdays at 10am UTC + manual dispatch
+# =============================================================
+
+name: CloudPilot Chaos Tests
+
+on:
+  schedule:
+    # Weekdays at 10:00 UTC
+    - cron: '0 10 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      failure_type:
+        description: 'Type of failure to inject'
+        required: true
+        default: 'pod-kill'
+        type: choice
+        options:
+          - pod-kill
+          - cpu-stress
+          - memory-stress
+          - network-latency
+          - disk-fill
+          - all
+      duration:
+        description: 'Duration of chaos experiment in seconds'
+        required: true
+        default: '60'
+        type: string
+      slo_threshold:
+        description: 'Minimum SLO availability threshold (%)'
+        required: false
+        default: '99.0'
+        type: string
+
+env:
+  KUBE_NS: cloudpilot
+  CLOUDPILOT_IMAGE: cloudpilot:chaos-test
+  KIND_CLUSTER_NAME: cloudpilot-chaos
+  CHAOS_DURATION: ${{ github.event.inputs.duration || '60' }}
+  FAILURE_TYPE: ${{ github.event.inputs.failure_type || 'pod-kill' }}
+  SLO_THRESHOLD: ${{ github.event.inputs.slo_threshold || '99.0' }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Job: Chaos Test
+  # ─────────────────────────────────────────────────────────────
+  chaos-test:
+    name: 🔥 Chaos Engineering Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # ── Setup ───────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt httpx
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          kind version
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.16.1'
+
+      # ── Create Kind Cluster ──────────────────────────────────
+      - name: Create kind cluster
+        run: |
+          cat <<EOF | kind create cluster --name=${{ env.KIND_CLUSTER_NAME }} --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+            - role: worker
+            - role: worker
+          EOF
+          kubectl cluster-info --context kind-${{ env.KIND_CLUSTER_NAME }}
+          echo "✅ Kind cluster created"
+
+      # ── Build & Load Image ───────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build CloudPilot Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.CLOUDPILOT_IMAGE }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Load image into kind cluster
+        run: |
+          kind load docker-image ${{ env.CLOUDPILOT_IMAGE }} \
+            --name=${{ env.KIND_CLUSTER_NAME }}
+          echo "✅ Image loaded into kind cluster"
+
+      # ── Deploy CloudPilot ────────────────────────────────────
+      - name: Create namespace
+        run: |
+          kubectl create namespace ${{ env.KUBE_NS }} --dry-run=client -o yaml \
+            | kubectl apply -f -
+
+      - name: Create test secrets
+        run: |
+          kubectl create secret generic cloudpilot-secrets \
+            --namespace=${{ env.KUBE_NS }} \
+            --from-literal=GEMINI_API_KEY=test-key-for-chaos \
+            --dry-run=client -o yaml \
+            | kubectl apply -f -
+
+      - name: Deploy CloudPilot to kind
+        run: |
+          # Patch image tag in manifests for chaos test
+          sed 's|image: cloudpilot:latest|image: ${{ env.CLOUDPILOT_IMAGE }}|g' \
+            k8s/deployment.yaml > /tmp/deployment-chaos.yaml
+
+          kubectl apply -f /tmp/deployment-chaos.yaml --namespace=${{ env.KUBE_NS }}
+          kubectl apply -f k8s/service.yaml --namespace=${{ env.KUBE_NS }} || true
+          kubectl apply -f k8s/hpa.yaml --namespace=${{ env.KUBE_NS }} || true
+
+          echo "Waiting for initial deployment..."
+          kubectl rollout status deployment/cloudpilot \
+            --namespace=${{ env.KUBE_NS }} \
+            --timeout=180s
+          echo "✅ CloudPilot deployed for chaos testing"
+
+      - name: Verify deployment is healthy before chaos
+        run: |
+          kubectl port-forward svc/cloudpilot-service 8000:8000 \
+            --namespace=${{ env.KUBE_NS }} &
+          PF_PID=$!
+          sleep 5
+
+          RETRIES=10
+          for i in $(seq 1 $RETRIES); do
+            if curl -sf http://localhost:8000/health > /dev/null; then
+              echo "✅ Pre-chaos health check passed"
+              kill $PF_PID 2>/dev/null || true
+              exit 0
+            fi
+            echo "[$i/$RETRIES] Waiting for app to be healthy..."
+            sleep 3
+          done
+          kill $PF_PID 2>/dev/null || true
+          echo "❌ App not healthy before chaos — aborting"
+          exit 1
+
+      # ── Start SLO Monitor ────────────────────────────────────
+      - name: Start SLO monitoring in background
+        run: |
+          cat > /tmp/slo_monitor.py << 'PYEOF'
+          import time
+          import json
+          import subprocess
+          import urllib.request
+          import urllib.error
+
+          results = {"total": 0, "success": 0, "errors": [], "latencies": []}
+          url = "http://localhost:8000/health"
+          duration = int("${{ env.CHAOS_DURATION }}") + 30
+          start = time.time()
+
+          print(f"Starting SLO monitor for {duration}s...")
+          while time.time() - start < duration:
+              t0 = time.time()
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as resp:
+                      latency = (time.time() - t0) * 1000
+                      results["total"] += 1
+                      results["success"] += 1
+                      results["latencies"].append(latency)
+              except Exception as e:
+                  latency = (time.time() - t0) * 1000
+                  results["total"] += 1
+                  results["errors"].append(str(e))
+                  results["latencies"].append(latency)
+              time.sleep(1)
+
+          slo = (results["success"] / results["total"] * 100) if results["total"] > 0 else 0
+          avg_latency = sum(results["latencies"]) / len(results["latencies"]) if results["latencies"] else 0
+          p99 = sorted(results["latencies"])[int(len(results["latencies"]) * 0.99)] if results["latencies"] else 0
+
+          report = {
+              "total_requests": results["total"],
+              "successful_requests": results["success"],
+              "failed_requests": len(results["errors"]),
+              "availability_pct": round(slo, 4),
+              "avg_latency_ms": round(avg_latency, 2),
+              "p99_latency_ms": round(p99, 2),
+              "errors_sample": results["errors"][:5],
+          }
+          with open("/tmp/slo_results.json", "w") as f:
+              json.dump(report, f, indent=2)
+          print(json.dumps(report, indent=2))
+          PYEOF
+
+          kubectl port-forward svc/cloudpilot-service 8000:8000 \
+            --namespace=${{ env.KUBE_NS }} &
+          echo "PF_PID=$!" >> $GITHUB_ENV
+          sleep 3
+
+          nohup python3 /tmp/slo_monitor.py > /tmp/slo_monitor.log 2>&1 &
+          echo "SLO_MONITOR_PID=$!" >> $GITHUB_ENV
+          echo "✅ SLO monitor started"
+
+      # ── Inject Failures ──────────────────────────────────────
+      - name: Inject failure — pod-kill
+        if: env.FAILURE_TYPE == 'pod-kill' || env.FAILURE_TYPE == 'all'
+        run: |
+          echo "🔥 Injecting failure: pod-kill"
+          PODS=$(kubectl get pods -n ${{ env.KUBE_NS }} -l app=cloudpilot \
+            --no-headers -o custom-columns=":metadata.name")
+
+          RANDOM_POD=$(echo "$PODS" | shuf -n 1)
+          if [ -n "$RANDOM_POD" ]; then
+            echo "Killing pod: $RANDOM_POD"
+            kubectl delete pod "$RANDOM_POD" \
+              --namespace=${{ env.KUBE_NS }} \
+              --grace-period=0 \
+              --force
+            echo "✅ Pod killed: $RANDOM_POD"
+          else
+            echo "⚠️  No pods found to kill"
+          fi
+
+      - name: Inject failure — cpu-stress
+        if: env.FAILURE_TYPE == 'cpu-stress' || env.FAILURE_TYPE == 'all'
+        run: |
+          echo "🔥 Injecting failure: cpu-stress"
+          RANDOM_POD=$(kubectl get pods -n ${{ env.KUBE_NS }} -l app=cloudpilot \
+            --no-headers -o custom-columns=":metadata.name" | head -1)
+
+          if [ -n "$RANDOM_POD" ]; then
+            kubectl exec "$RANDOM_POD" -n ${{ env.KUBE_NS }} -- \
+              sh -c "dd if=/dev/zero bs=1M count=500 | md5sum &" 2>/dev/null || true
+            echo "✅ CPU stress injected into: $RANDOM_POD"
+          fi
+
+      - name: Inject failure — network-latency (tc netem)
+        if: env.FAILURE_TYPE == 'network-latency' || env.FAILURE_TYPE == 'all'
+        run: |
+          echo "🔥 Injecting failure: network-latency (simulated via slow-start)"
+          # Simulate by temporarily scaling down and back up
+          kubectl scale deployment/cloudpilot \
+            --replicas=0 \
+            --namespace=${{ env.KUBE_NS }}
+          sleep 10
+          kubectl scale deployment/cloudpilot \
+            --replicas=2 \
+            --namespace=${{ env.KUBE_NS }}
+          echo "✅ Network-latency chaos simulated via scale down/up"
+
+      # ── Wait for Chaos Duration ──────────────────────────────
+      - name: Wait for chaos duration
+        run: |
+          echo "⏳ Chaos experiment running for ${{ env.CHAOS_DURATION }} seconds..."
+          sleep ${{ env.CHAOS_DURATION }}
+          echo "✅ Chaos duration elapsed"
+
+      # ── Wait for Recovery ────────────────────────────────────
+      - name: Wait for system recovery
+        run: |
+          echo "⏳ Waiting for system to recover..."
+          kubectl rollout status deployment/cloudpilot \
+            --namespace=${{ env.KUBE_NS }} \
+            --timeout=180s
+          echo "✅ Deployment recovered"
+
+          # Allow SLO monitor to collect post-recovery data
+          sleep 10
+
+      # ── Stop SLO Monitor ─────────────────────────────────────
+      - name: Stop SLO monitor
+        run: |
+          kill $SLO_MONITOR_PID 2>/dev/null || true
+          kill $PF_PID 2>/dev/null || true
+          sleep 2
+          cat /tmp/slo_monitor.log || true
+          echo "✅ SLO monitor stopped"
+
+      # ── Check SLO Compliance ─────────────────────────────────
+      - name: Check SLO compliance
+        run: |
+          if [ ! -f /tmp/slo_results.json ]; then
+            echo "❌ SLO results file not found!"
+            exit 1
+          fi
+
+          cat /tmp/slo_results.json
+
+          AVAILABILITY=$(python3 -c "
+          import json
+          with open('/tmp/slo_results.json') as f:
+              data = json.load(f)
+          print(data['availability_pct'])
+          ")
+
+          THRESHOLD="${{ env.SLO_THRESHOLD }}"
+          echo "SLO Availability: ${AVAILABILITY}%"
+          echo "SLO Threshold: ${THRESHOLD}%"
+
+          PASSED=$(python3 -c "
+          print('yes' if float('$AVAILABILITY') >= float('$THRESHOLD') else 'no')
+          ")
+
+          if [ "$PASSED" = "yes" ]; then
+            echo "✅ SLO COMPLIANT — Availability ${AVAILABILITY}% >= ${THRESHOLD}%"
+            echo "SLO_PASSED=true" >> $GITHUB_ENV
+          else
+            echo "❌ SLO VIOLATION — Availability ${AVAILABILITY}% < ${THRESHOLD}%"
+            echo "SLO_PASSED=false" >> $GITHUB_ENV
+          fi
+
+      # ── Generate Chaos Report ────────────────────────────────
+      - name: Generate chaos report
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          python3 << 'PYEOF'
+          import json
+          import os
+
+          with open('/tmp/slo_results.json') as f:
+              slo = json.load(f)
+
+          report = {
+              "chaos_experiment": {
+                  "timestamp": "$TIMESTAMP",
+                  "failure_type": "${{ env.FAILURE_TYPE }}",
+                  "duration_seconds": int("${{ env.CHAOS_DURATION }}"),
+                  "slo_threshold_pct": float("${{ env.SLO_THRESHOLD }}"),
+                  "cluster": "${{ env.KIND_CLUSTER_NAME }}",
+                  "namespace": "${{ env.KUBE_NS }}",
+                  "image": "${{ env.CLOUDPILOT_IMAGE }}",
+                  "workflow_run": "${{ github.run_id }}",
+                  "trigger": "${{ github.event_name }}"
+              },
+              "slo_results": slo,
+              "compliance": {
+                  "passed": slo["availability_pct"] >= float("${{ env.SLO_THRESHOLD }}"),
+                  "margin_pct": round(slo["availability_pct"] - float("${{ env.SLO_THRESHOLD }}"), 4)
+              }
+          }
+
+          with open('chaos-report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+
+          print(json.dumps(report, indent=2))
+          PYEOF
+
+          # Markdown summary
+          echo "# 🔥 Chaos Test Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Failure Type | ${{ env.FAILURE_TYPE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Duration | ${{ env.CHAOS_DURATION }}s |" >> $GITHUB_STEP_SUMMARY
+          echo "| SLO Threshold | ${{ env.SLO_THRESHOLD }}% |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## SLO Results" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/slo_results.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          if [ "$SLO_PASSED" = "true" ]; then
+            echo "## ✅ SLO COMPLIANT" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ SLO VIOLATION" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload chaos report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-report-${{ github.run_id }}
+          path: |
+            chaos-report.json
+            /tmp/slo_results.json
+            /tmp/slo_monitor.log
+          retention-days: 90
+
+      # ── Cleanup ──────────────────────────────────────────────
+      - name: Cleanup kind cluster
+        if: always()
+        run: |
+          kind delete cluster --name=${{ env.KIND_CLUSTER_NAME }} 2>/dev/null || true
+          echo "✅ Kind cluster deleted"
+
+      - name: Fail if SLO violated
+        if: env.SLO_PASSED == 'false'
+        run: |
+          echo "❌ Chaos test FAILED — SLO violated!"
+          exit 1
